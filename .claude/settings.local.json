@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /c/Users/ahmet/OneDrive/Belgeler/GitHub/SOAR-Platform/apps/frontend/src/app/\\\\\\(dashboard\\\\\\)/settings)",
+      "Bash(find /c/Users/ahmet/OneDrive/Belgeler/GitHub/SOAR-Platform/apps -name *.ts -path */backend/* -name *integration*)",
+      "Bash(xargs ls:*)",
+      "Bash(git -C /c/Users/ahmet/OneDrive/Belgeler/GitHub/SOAR-Platform log --oneline)",
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}
