@@ -1,0 +1,309 @@
+import { Job } from 'bullmq';
+import IORedis from 'ioredis';
+import axios from 'axios';
+import { getQueue, getWorker } from '../queue';
+import { query, queryOne } from '../../db/pool';
+import { cacheGet, cacheSet } from '../../db/redis';
+import { decryptApiKey } from '../../utils/crypto';
+import { normalizeZabbix } from '../../services/normalizer';
+import { Integration, NormalizedEvent } from '../../types';
+import logger from '../../utils/logger';
+
+interface ZabbixJobData {
+  integrationId?: string;
+  isTest?: boolean;
+}
+
+export interface ZabbixHost {
+  hostid: string;
+  host: string;
+  name: string;
+  status: string;
+  interfaces?: Array<{ ip: string }>;
+}
+
+const AUTH_CACHE_KEY = 'zabbix:auth_token';
+const AUTH_TTL = 3600;
+let rpcId = 1;
+
+// ─── Zabbix JSON-RPC Yardımcısı ─────────────────────────────────────────────
+
+async function zabbixRPC(
+  baseUrl: string,
+  method: string,
+  params: Record<string, unknown>,
+  authToken?: string,
+): Promise<unknown> {
+  const body: Record<string, unknown> = {
+    jsonrpc: '2.0',
+    method,
+    params,
+    id: rpcId++,
+  };
+  if (authToken) body.auth = authToken;
+
+  const response = await axios.post(`${baseUrl}/api_jsonrpc.php`, body, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 30000,
+  });
+
+  if (response.data?.error) {
+    throw new Error(`Zabbix API hatası: ${JSON.stringify(response.data.error)}`);
+  }
+  return response.data?.result;
+}
+
+// ─── Auth Token ──────────────────────────────────────────────────────────────
+
+async function getAuthToken(
+  baseUrl: string,
+  username: string,
+  password: string,
+): Promise<string> {
+  const cached = await cacheGet<string>(AUTH_CACHE_KEY);
+  if (cached) return cached;
+
+  const token = (await zabbixRPC(baseUrl, 'user.login', {
+    username,
+    password,
+  })) as string;
+
+  if (!token) throw new Error('Zabbix auth token alınamadı');
+
+  await cacheSet(AUTH_CACHE_KEY, token, AUTH_TTL);
+  return token;
+}
+
+// ─── Worker Processor ────────────────────────────────────────────────────────
+
+async function processZabbix(job: Job<ZabbixJobData>): Promise<void> {
+  const { isTest } = job.data;
+
+  const integration = await queryOne<Integration>(
+    `SELECT * FROM integrations WHERE name = 'zabbix' AND status IN ('active', 'syncing')`,
+  );
+
+  if (!integration) {
+    logger.warn('[Zabbix] Aktif entegrasyon bulunamadı');
+    return;
+  }
+
+  await query(`UPDATE integrations SET status = 'syncing', updated_at = NOW() WHERE id = $1`, [
+    integration.id,
+  ]);
+
+  try {
+    const apiKeyRow = await queryOne<{ key_hash: string }>(
+      `SELECT key_hash FROM api_keys WHERE integration_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [integration.id],
+    );
+
+    if (!apiKeyRow) throw new Error('API anahtarı bulunamadı');
+    const credentials = decryptApiKey(apiKeyRow.key_hash);
+    const [username, password] = credentials.includes(':')
+      ? [credentials.split(':')[0], credentials.split(':').slice(1).join(':')]
+      : [credentials, ''];
+
+    // Adım 1: Auth
+    const authToken = await getAuthToken(integration.base_url, username, password);
+
+    if (isTest) {
+      await query(
+        `UPDATE integrations SET status = 'active', error_message = NULL, updated_at = NOW() WHERE id = $1`,
+        [integration.id],
+      );
+      logger.info('[Zabbix] Bağlantı testi başarılı');
+      return;
+    }
+
+    // Adım 2: Host listesi
+    const hosts = (await zabbixRPC(integration.base_url, 'host.get', {
+      output: ['hostid', 'host', 'name', 'status'],
+      selectInterfaces: ['ip'],
+    }, authToken)) as ZabbixHost[];
+
+    logger.info(`[Zabbix] ${hosts.length} host bulundu`);
+
+    // Adım 3: Aktif problemleri çek
+    const lastSync = integration.last_sync_at
+      ? Math.floor(new Date(integration.last_sync_at).getTime() / 1000)
+      : Math.floor(Date.now() / 1000) - 86400;
+
+    const problems = (await zabbixRPC(integration.base_url, 'problem.get', {
+      output: 'extend',
+      selectHosts: ['hostid', 'host', 'name'],
+      recent: true,
+      time_from: lastSync,
+    }, authToken)) as Record<string, unknown>[];
+
+    logger.info(`[Zabbix] ${problems.length} problem çekildi`);
+
+    // Problem'leri security_events'e kaydet
+    for (const problem of problems) {
+      const event: NormalizedEvent = normalizeZabbix(problem, integration.id);
+      await query(
+        `INSERT INTO security_events
+          (time, integration_id, integration_name, source_ip, dest_ip, source_host, dest_host,
+           severity, event_type, title, description, raw_payload)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT DO NOTHING`,
+        [
+          event.time,
+          event.integration_id,
+          event.integration_name,
+          event.source_ip ?? null,
+          event.dest_ip ?? null,
+          event.source_host ?? null,
+          event.dest_host ?? null,
+          event.severity,
+          event.event_type,
+          event.title,
+          event.description,
+          JSON.stringify(event.raw_payload),
+        ],
+      );
+    }
+
+    // Adım 4-5: Sistem metrikleri
+    const hostIds = hosts.map((h) => h.hostid);
+    if (hostIds.length > 0) {
+      await collectMetrics(integration.base_url, authToken, hosts, lastSync);
+    }
+
+    await query(
+      `UPDATE integrations SET status = 'active', last_sync_at = NOW(), error_message = NULL, updated_at = NOW() WHERE id = $1`,
+      [integration.id],
+    );
+
+    logger.info(`[Zabbix] Sync tamamlandı. ${problems.length} problem, metrikleri işlendi`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Bilinmeyen hata';
+    await query(
+      `UPDATE integrations SET status = 'error', error_message = $1, updated_at = NOW() WHERE id = $2`,
+      [message, integration.id],
+    );
+    logger.error('[Zabbix] Sync hatası', { error: message });
+    throw err;
+  }
+}
+
+// ─── Metrik Toplama ──────────────────────────────────────────────────────────
+
+const METRIC_KEYS: Record<string, string> = {
+  'system.cpu.util': 'cpu_usage',
+  'vm.memory.size[pused]': 'memory_used_percent',
+  'vfs.fs.size[/,pused]': 'disk_used_percent',
+  'system.uptime': 'uptime_seconds',
+};
+
+async function collectMetrics(
+  baseUrl: string,
+  authToken: string,
+  hosts: ZabbixHost[],
+  sinceTimestamp: number,
+): Promise<void> {
+  const hostIds = hosts.map((h) => h.hostid);
+
+  // İlgili item'ları bul
+  const items = (await zabbixRPC(baseUrl, 'item.get', {
+    output: ['itemid', 'name', 'key_', 'units', 'lastvalue', 'hostid'],
+    hostids: hostIds,
+    search: { key_: 'system.cpu.util,vm.memory,vfs.fs.size,system.uptime' },
+    searchByAny: true,
+  }, authToken)) as Array<Record<string, string>>;
+
+  if (items.length === 0) return;
+
+  const hostMap = new Map(hosts.map((h) => [h.hostid, h]));
+  const now = Math.floor(Date.now() / 1000);
+
+  // Her item için son değerleri al
+  for (const item of items) {
+    const host = hostMap.get(item.hostid);
+    if (!host) continue;
+
+    const metricName = Object.entries(METRIC_KEYS).find(([key]) =>
+      item.key_.startsWith(key.split('[')[0]),
+    )?.[1];
+
+    if (!metricName) continue;
+
+    const ip = host.interfaces?.[0]?.ip ?? '';
+    const value = parseFloat(item.lastvalue) || 0;
+
+    await query(
+      `INSERT INTO system_metrics (time, host_id, host_name, metric_name, value, unit, tags)
+       VALUES (NOW(), $1, $2, $3, $4, $5, $6)
+       ON CONFLICT DO NOTHING`,
+      [
+        host.hostid,
+        host.name || host.host,
+        metricName,
+        value,
+        item.units || (metricName.includes('percent') ? '%' : ''),
+        JSON.stringify({ ip, host_key: host.host }),
+      ],
+    );
+  }
+
+  logger.debug(`[Zabbix] ${items.length} metrik işlendi`);
+}
+
+// ─── Dışa açık fonksiyon — host listesi ──────────────────────────────────────
+
+export async function getZabbixHosts(): Promise<ZabbixHost[]> {
+  const integration = await queryOne<Integration>(
+    `SELECT * FROM integrations WHERE name = 'zabbix' AND status = 'active'`,
+  );
+
+  if (!integration) return [];
+
+  const apiKeyRow = await queryOne<{ key_hash: string }>(
+    `SELECT key_hash FROM api_keys WHERE integration_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [integration.id],
+  );
+
+  if (!apiKeyRow) return [];
+
+  const credentials = decryptApiKey(apiKeyRow.key_hash);
+  const [username, password] = credentials.includes(':')
+    ? [credentials.split(':')[0], credentials.split(':').slice(1).join(':')]
+    : [credentials, ''];
+
+  const authToken = await getAuthToken(integration.base_url, username, password);
+
+  return (await zabbixRPC(integration.base_url, 'host.get', {
+    output: ['hostid', 'host', 'name', 'status'],
+    selectInterfaces: ['ip'],
+  }, authToken)) as ZabbixHost[];
+}
+
+// ─── Worker Kaydı ────────────────────────────────────────────────────────────
+
+export function registerZabbixWorker(connection: IORedis): void {
+  const worker = getWorker('zabbix_collector', processZabbix);
+
+  (async () => {
+    try {
+      const integration = await queryOne<Integration>(
+        `SELECT poll_interval_sec FROM integrations WHERE name = 'zabbix' AND status = 'active'`,
+      );
+      if (integration) {
+        const queue = getQueue('zabbix_collector');
+        await queue.add(
+          'scheduled_collect',
+          {},
+          {
+            repeat: { every: integration.poll_interval_sec * 1000 },
+            jobId: 'zabbix_scheduled',
+          },
+        );
+        logger.info(`[Zabbix] Repeatable job kayıt edildi (her ${integration.poll_interval_sec}s)`);
+      }
+    } catch (err) {
+      logger.error('[Zabbix] Repeatable job kayıt hatası', { error: (err as Error).message });
+    }
+  })();
+
+  logger.info('[Zabbix] Worker başlatıldı');
+}

@@ -1,0 +1,197 @@
+import { Job } from 'bullmq';
+import IORedis from 'ioredis';
+import axios from 'axios';
+import { getQueue, getWorker } from '../queue';
+import { query, queryOne } from '../../db/pool';
+import { decryptApiKey } from '../../utils/crypto';
+import { normalizePanorama } from '../../services/normalizer';
+import { Integration, NormalizedEvent } from '../../types';
+import logger from '../../utils/logger';
+
+interface PanoramaJobData {
+  integrationId?: string;
+  isTest?: boolean;
+}
+
+async function processPanorama(job: Job<PanoramaJobData>): Promise<void> {
+  const { isTest } = job.data;
+
+  const integration = await queryOne<Integration>(
+    `SELECT * FROM integrations WHERE name = 'palo_alto_panorama' AND status IN ('active', 'syncing')`,
+  );
+
+  if (!integration) {
+    logger.warn('[Panorama] Aktif entegrasyon bulunamadı');
+    return;
+  }
+
+  await query(`UPDATE integrations SET status = 'syncing', updated_at = NOW() WHERE id = $1`, [
+    integration.id,
+  ]);
+
+  try {
+    const apiKeyRow = await queryOne<{ key_hash: string }>(
+      `SELECT key_hash FROM api_keys WHERE integration_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [integration.id],
+    );
+
+    if (!apiKeyRow) throw new Error('API anahtarı bulunamadı');
+    const apiKey = decryptApiKey(apiKeyRow.key_hash);
+
+    if (isTest) {
+      await testConnection(integration.base_url, apiKey);
+      await query(
+        `UPDATE integrations SET status = 'active', error_message = NULL, updated_at = NOW() WHERE id = $1`,
+        [integration.id],
+      );
+      logger.info('[Panorama] Bağlantı testi başarılı');
+      return;
+    }
+
+    // Threat loglarını çek
+    const threatLogs = await fetchLogs(integration.base_url, apiKey, 'threat');
+    logger.info(`[Panorama] ${threatLogs.length} threat log çekildi`);
+
+    // Traffic loglarında engellenen bağlantıları çek
+    const trafficLogs = await fetchLogs(integration.base_url, apiKey, 'traffic', 'deny');
+    logger.info(`[Panorama] ${trafficLogs.length} denied traffic log çekildi`);
+
+    const allLogs = [...threatLogs, ...trafficLogs];
+
+    let insertedCount = 0;
+    for (const rawLog of allLogs) {
+      const event: NormalizedEvent = normalizePanorama(rawLog, integration.id);
+      await query(
+        `INSERT INTO security_events
+          (time, integration_id, integration_name, source_ip, dest_ip, source_host, dest_host,
+           severity, event_type, title, description, raw_payload)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT DO NOTHING`,
+        [
+          event.time,
+          event.integration_id,
+          event.integration_name,
+          event.source_ip ?? null,
+          event.dest_ip ?? null,
+          event.source_host ?? null,
+          event.dest_host ?? null,
+          event.severity,
+          event.event_type,
+          event.title,
+          event.description,
+          JSON.stringify(event.raw_payload),
+        ],
+      );
+      insertedCount++;
+    }
+
+    await query(
+      `UPDATE integrations SET status = 'active', last_sync_at = NOW(), error_message = NULL, updated_at = NOW() WHERE id = $1`,
+      [integration.id],
+    );
+
+    logger.info(`[Panorama] Sync tamamlandı. ${insertedCount} event işlendi`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Bilinmeyen hata';
+    await query(
+      `UPDATE integrations SET status = 'error', error_message = $1, updated_at = NOW() WHERE id = $2`,
+      [message, integration.id],
+    );
+    logger.error('[Panorama] Sync hatası', { error: message });
+    throw err;
+  }
+}
+
+// ─── Panorama API ────────────────────────────────────────────────────────────
+
+async function fetchLogs(
+  baseUrl: string,
+  apiKey: string,
+  logType: 'threat' | 'traffic',
+  actionFilter?: string,
+): Promise<Record<string, unknown>[]> {
+  const params: Record<string, string> = {
+    type: 'log',
+    'log-type': logType,
+    action: 'get',
+    key: apiKey,
+  };
+  if (actionFilter) {
+    params.query = `(action eq ${actionFilter})`;
+  }
+
+  const response = await axios.get(`${baseUrl}/api/`, {
+    params,
+    timeout: 30000,
+  });
+
+  // Panorama XML veya JSON yanıt verebilir
+  const data = response.data;
+
+  // JSON yanıt
+  if (typeof data === 'object' && data !== null) {
+    const logs = data?.result?.log?.logs?.entry ?? data?.result?.entries ?? [];
+    return Array.isArray(logs) ? logs : [logs].filter(Boolean);
+  }
+
+  // XML yanıt — basit regex ile parse et
+  if (typeof data === 'string') {
+    return parseXMLEntries(data);
+  }
+
+  return [];
+}
+
+function parseXMLEntries(xml: string): Record<string, unknown>[] {
+  const entries: Record<string, unknown>[] = [];
+  const entryRegex = /<entry[^>]*>([\s\S]*?)<\/entry>/gi;
+  const fieldRegex = /<(\w+)>([\s\S]*?)<\/\1>/g;
+
+  let entryMatch: RegExpExecArray | null;
+  while ((entryMatch = entryRegex.exec(xml)) !== null) {
+    const entry: Record<string, unknown> = {};
+    let fieldMatch: RegExpExecArray | null;
+    while ((fieldMatch = fieldRegex.exec(entryMatch[1])) !== null) {
+      entry[fieldMatch[1]] = fieldMatch[2];
+    }
+    if (Object.keys(entry).length > 0) entries.push(entry);
+  }
+  return entries;
+}
+
+async function testConnection(baseUrl: string, apiKey: string): Promise<void> {
+  await axios.get(`${baseUrl}/api/`, {
+    params: { type: 'op', cmd: '<show><system><info></info></system></show>', key: apiKey },
+    timeout: 15000,
+  });
+}
+
+// ─── Worker Kaydı ────────────────────────────────────────────────────────────
+
+export function registerPanoramaWorker(connection: IORedis): void {
+  const worker = getWorker('panorama_collector', processPanorama);
+
+  (async () => {
+    try {
+      const integration = await queryOne<Integration>(
+        `SELECT poll_interval_sec FROM integrations WHERE name = 'palo_alto_panorama' AND status = 'active'`,
+      );
+      if (integration) {
+        const queue = getQueue('panorama_collector');
+        await queue.add(
+          'scheduled_collect',
+          {},
+          {
+            repeat: { every: integration.poll_interval_sec * 1000 },
+            jobId: 'panorama_scheduled',
+          },
+        );
+        logger.info(`[Panorama] Repeatable job kayıt edildi (her ${integration.poll_interval_sec}s)`);
+      }
+    } catch (err) {
+      logger.error('[Panorama] Repeatable job kayıt hatası', { error: (err as Error).message });
+    }
+  })();
+
+  logger.info('[Panorama] Worker başlatıldı');
+}
