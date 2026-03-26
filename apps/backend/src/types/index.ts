@@ -1,0 +1,267 @@
+// ─── RBAC ────────────────────────────────────────────────────────────────────
+
+export type RoleName = 'super_admin' | 'admin' | 'analyst' | 'c_level';
+
+export interface RolePermissions {
+  view_executive_dashboard: boolean;
+  view_analyst_dashboard: boolean;
+  view_security_events: boolean;
+  view_system_metrics: boolean;
+  manage_integrations: boolean;
+  manage_users: boolean;
+  manage_api_keys: boolean;
+  trigger_virustotal: boolean;
+  view_reports: boolean;
+  generate_reports: boolean;
+  manage_alert_rules: boolean;
+  view_audit_logs: boolean;
+}
+
+export interface Role {
+  id: string;
+  name: RoleName;
+  display_name: string;
+  permissions: RolePermissions;
+  created_at: Date;
+}
+
+export interface User {
+  id: string;
+  username: string;
+  email: string;
+  password_hash: string;
+  role_id: string;
+  role?: Role;
+  is_active: boolean;
+  last_login: Date | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+// ─── JWT ─────────────────────────────────────────────────────────────────────
+
+export interface JWTPayload {
+  sub: string;          // user id
+  username: string;
+  email: string;
+  role: RoleName;
+  permissions: RolePermissions;
+  iat?: number;
+  exp?: number;
+}
+
+export interface TokenPair {
+  accessToken: string;
+  refreshToken: string;
+}
+
+// ─── INTEGRATIONS ────────────────────────────────────────────────────────────
+
+export type IntegrationName =
+  | 'cortex_xdr'
+  | 'palo_alto_panorama'
+  | 'fortimail'
+  | 'zabbix'
+  | 'virustotal';
+
+export type IntegrationStatus = 'active' | 'error' | 'disabled' | 'syncing';
+
+export interface Integration {
+  id: string;
+  name: IntegrationName;
+  display_name: string;
+  base_url: string;
+  poll_interval_sec: number;
+  status: IntegrationStatus;
+  last_sync_at: Date | null;
+  error_message: string | null;
+  config: Record<string, unknown>;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface ApiKey {
+  id: string;
+  integration_id: string;
+  key_name: string;
+  key_hash: string;        // AES-256 şifreli
+  expires_at: Date | null;
+  last_used_at: Date | null;
+  created_by: string;
+  created_at: Date;
+}
+
+// ─── SECURITY EVENTS ─────────────────────────────────────────────────────────
+
+export type EventSeverity = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
+
+export type EventType =
+  | 'malware_detected'
+  | 'intrusion_attempt'
+  | 'firewall_block'
+  | 'email_threat'
+  | 'suspicious_process'
+  | 'lateral_movement'
+  | 'data_exfiltration'
+  | 'authentication_failure'
+  | 'policy_violation'
+  | 'vulnerability_exploit'
+  | 'unknown';
+
+export interface SecurityEvent {
+  id: string;
+  time: Date;
+  integration_id: string;
+  integration_name: IntegrationName;
+  source_ip: string | null;
+  dest_ip: string | null;
+  source_host: string | null;
+  dest_host: string | null;
+  severity: EventSeverity;
+  event_type: EventType;
+  title: string;
+  description: string;
+  raw_payload: Record<string, unknown>;
+  is_resolved: boolean;
+  resolved_by: string | null;
+  resolved_at: Date | null;
+  notes: string | null;
+}
+
+// Common Event Format — tüm kaynaklardan normalize edilen format
+export interface NormalizedEvent {
+  time: Date;
+  integration_id: string;
+  integration_name: IntegrationName;
+  source_ip?: string;
+  dest_ip?: string;
+  source_host?: string;
+  dest_host?: string;
+  severity: EventSeverity;
+  event_type: EventType;
+  title: string;
+  description: string;
+  raw_payload: Record<string, unknown>;
+}
+
+// ─── SYSTEM METRICS ──────────────────────────────────────────────────────────
+
+export interface SystemMetric {
+  time: Date;
+  host_id: string;
+  host_name: string;
+  metric_name: string;
+  value: number;
+  unit: string;
+  tags: Record<string, string>;
+}
+
+// ─── VIRUSTOTAL ──────────────────────────────────────────────────────────────
+
+export type HashType = 'sha256' | 'md5' | 'sha1';
+export type VTVerdict = 'clean' | 'suspicious' | 'malicious' | 'unknown';
+
+export interface VTScan {
+  id: string;
+  hash: string;
+  hash_type: HashType;
+  malicious_count: number;
+  suspicious_count: number;
+  harmless_count: number;
+  undetected_count: number;
+  total_engines: number;
+  verdict: VTVerdict;
+  file_name: string | null;
+  file_type: string | null;
+  file_size: number | null;
+  raw_response: Record<string, unknown>;
+  scanned_by: string;
+  scanned_at: Date;
+}
+
+// ─── REPORTS ─────────────────────────────────────────────────────────────────
+
+export type ReportType = 'daily' | 'weekly' | 'monthly';
+export type ReportTargetRole = 'c_level' | 'analyst' | 'all';
+
+export interface Report {
+  id: string;
+  type: ReportType;
+  target_role: ReportTargetRole;
+  period_start: Date;
+  period_end: Date;
+  pdf_path: string | null;
+  generated_at: Date;
+  generated_by: string | null;
+  metadata: Record<string, unknown>;
+}
+
+// ─── ALERTS ──────────────────────────────────────────────────────────────────
+
+export interface AlertRule {
+  id: string;
+  name: string;
+  description: string;
+  integration_name: IntegrationName | null;
+  event_type: EventType | null;
+  severity_threshold: EventSeverity;
+  condition: Record<string, unknown>;
+  action: 'notify' | 'log' | 'notify_and_log';
+  notify_channels: string[];
+  is_active: boolean;
+  created_by: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+// ─── AUDIT ───────────────────────────────────────────────────────────────────
+
+export interface AuditLog {
+  id: string;
+  user_id: string;
+  username: string;
+  action: string;
+  resource: string;
+  resource_id: string | null;
+  ip_address: string;
+  user_agent: string;
+  metadata: Record<string, unknown>;
+  created_at: Date;
+}
+
+// ─── API RESPONSES ───────────────────────────────────────────────────────────
+
+export interface ApiResponse<T = unknown> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  message?: string;
+  pagination?: {
+    page: number;
+    limit: number;
+    total: number;
+    total_pages: number;
+  };
+}
+
+// ─── DASHBOARD ───────────────────────────────────────────────────────────────
+
+export interface ExecutiveSummary {
+  total_threats_today: number;
+  total_threats_week: number;
+  critical_threats_today: number;
+  blocked_attacks_today: number;
+  systems_online: number;
+  systems_total: number;
+  overall_uptime_percent: number;
+  trend: 'improving' | 'stable' | 'worsening';
+}
+
+export interface AnalystStats {
+  events_by_severity: Record<string, number>;
+  events_by_type: Record<string, number>;
+  events_by_integration: Record<string, number>;
+  top_source_ips: Array<{ ip: string; count: number }>;
+  unresolved_count: number;
+  resolved_today: number;
+}

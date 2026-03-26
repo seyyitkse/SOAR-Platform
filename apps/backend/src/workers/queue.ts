@@ -1,0 +1,113 @@
+import { Queue, Worker, QueueEvents, Processor, WorkerOptions } from 'bullmq';
+import IORedis from 'ioredis';
+import logger from '../utils/logger';
+
+const queues = new Map<string, Queue>();
+const workers = new Map<string, Worker>();
+
+const QUEUE_NAMES = [
+  'cortex_xdr_collector',
+  'panorama_collector',
+  'fortimail_collector',
+  'zabbix_collector',
+  'virustotal_scanner',
+  'report_generator',
+] as const;
+
+export type QueueName = (typeof QUEUE_NAMES)[number];
+
+const DEFAULT_JOB_OPTIONS = {
+  attempts: 3,
+  backoff: {
+    type: 'exponential' as const,
+    delay: 5000,
+  },
+  removeOnComplete: { count: 1000 },
+  removeOnFail: { count: 5000 },
+};
+
+export function getQueue(name: string): Queue {
+  if (queues.has(name)) return queues.get(name)!;
+
+  const connection = new IORedis(process.env.REDIS_URL!, {
+    maxRetriesPerRequest: null,
+  });
+
+  const queue = new Queue(name, {
+    connection,
+    defaultJobOptions: DEFAULT_JOB_OPTIONS,
+  });
+
+  // Queue event'lerini logla
+  const queueEvents = new QueueEvents(name, { connection: connection.duplicate() });
+
+  queueEvents.on('completed', ({ jobId }) => {
+    logger.debug(`[Queue:${name}] Job ${jobId} tamamlandı`);
+  });
+
+  queueEvents.on('failed', ({ jobId, failedReason }) => {
+    logger.error(`[Queue:${name}] Job ${jobId} başarısız`, { reason: failedReason });
+  });
+
+  queueEvents.on('stalled', ({ jobId }) => {
+    logger.warn(`[Queue:${name}] Job ${jobId} takıldı (stalled)`);
+  });
+
+  queues.set(name, queue);
+  return queue;
+}
+
+export function getWorker(
+  name: string,
+  processor: Processor,
+  opts?: Partial<WorkerOptions>
+): Worker {
+  if (workers.has(name)) return workers.get(name)!;
+
+  const connection = new IORedis(process.env.REDIS_URL!, {
+    maxRetriesPerRequest: null,
+  });
+
+  const worker = new Worker(name, processor, {
+    connection,
+    concurrency: 1,
+    ...opts,
+  });
+
+  worker.on('completed', (job) => {
+    logger.info(`[Worker:${name}] Job ${job.id} tamamlandı`);
+  });
+
+  worker.on('failed', (job, err) => {
+    logger.error(`[Worker:${name}] Job ${job?.id} başarısız`, {
+      error: err.message,
+      stack: err.stack,
+    });
+  });
+
+  worker.on('stalled', (jobId) => {
+    logger.warn(`[Worker:${name}] Job ${jobId} takıldı (stalled)`);
+  });
+
+  worker.on('error', (err) => {
+    logger.error(`[Worker:${name}] Worker hatası`, { error: err.message });
+  });
+
+  workers.set(name, worker);
+  return worker;
+}
+
+export async function closeAllQueues(): Promise<void> {
+  const closing: Promise<void>[] = [];
+  for (const [name, worker] of workers) {
+    logger.info(`Worker kapatılıyor: ${name}`);
+    closing.push(worker.close());
+  }
+  for (const [name, queue] of queues) {
+    logger.info(`Queue kapatılıyor: ${name}`);
+    closing.push(queue.close());
+  }
+  await Promise.all(closing);
+  workers.clear();
+  queues.clear();
+}
